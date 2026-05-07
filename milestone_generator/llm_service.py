@@ -5,18 +5,18 @@ LangGraph-powered milestone generation pipeline.
 Uses Groq API (llama-3.3-70b-versatile) — free tier: 14,400 req/day.
 
 Graph flow:
-    START → generate_milestone_plans_node → END
+    START → plan_milestones_node → END
 
-Single node: one LLM call that assigns roles AND generates milestones
-for all team members simultaneously.
+Single node: one LLM call that reads real team member details
+and generates personalised milestones per member.
 """
 
 import os
 import json
-from typing import TypedDict, List
+from typing import TypedDict, List, Any
 from dotenv import load_dotenv
 
-load_dotenv()  # loads GEMINI_API_KEY from .env
+load_dotenv()
 
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage
@@ -44,13 +44,12 @@ class MilestoneState(TypedDict):
     detailed_description: str
     category: str
     difficulty_level: str
-    team_size: int
+    team_members: List[Any]        # flexible — any shape the caller provides
     required_skills: List[str]
     project_budget: str
     estimated_duration: str
     application_deadline: str
     # Output
-    assigned_roles: List[dict]
     milestone_plans: List[dict]
 
 
@@ -66,12 +65,30 @@ def _parse_json(raw: str) -> dict | list:
     return json.loads(text)
 
 
+def _format_team_members(members: List[Any]) -> str:
+    """
+    Convert the team_members list to a readable string for the prompt.
+    Works regardless of member shape (dict, string, nested object, etc.).
+    """
+    lines = []
+    for i, member in enumerate(members, start=1):
+        if isinstance(member, dict):
+            # Pretty-print key-value pairs for dict members
+            details = ", ".join(f"{k}: {v}" for k, v in member.items())
+            lines.append(f"  Member {i}: {details}")
+        else:
+            # Fallback for plain strings or anything else
+            lines.append(f"  Member {i}: {member}")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
-# Single node: assign roles + generate milestones in ONE LLM call
+# Single node: generate milestones for each real team member
 # ---------------------------------------------------------------------------
 
 def plan_milestones(state: MilestoneState) -> MilestoneState:
     skills_str = ", ".join(state["required_skills"]) if state["required_skills"] else "N/A"
+    team_str   = _format_team_members(state["team_members"])
 
     prompt = f"""
 You are an expert project manager planning a student software project.
@@ -83,47 +100,42 @@ PROJECT DETAILS:
 - Category: {state["category"]}
 - Difficulty: {state["difficulty_level"]}
 - Required Skills: {skills_str}
-- Team Size: {state["team_size"]} members
 - Budget: {state.get("project_budget") or "N/A"}
 - Estimated Duration: {state.get("estimated_duration") or "N/A"}
 - Application Deadline: {state.get("application_deadline") or "N/A"}
 
-TASK:
-1. Assign one distinct, relevant role to each of the {state["team_size"]} member slots
-   (Member 1, Member 2, … Member {state["team_size"]}).
-   Roles must suit the project domain and required skills.
+TEAM MEMBERS (with their details / specialisations):
+{team_str}
 
-2. For each member, generate a personalised milestone plan with 4–6 milestones that:
-   - Progress logically: research → design → build → test → deploy/review.
-   - Are deeply tailored to that member's role.
-   - Fit within the project timeline.
+TASK:
+For EACH team member listed above, generate a personalised milestone plan with 4–6 milestones that:
+  - Leverage that member's specific skills / specialisation.
+  - Progress logically: research → design → build → test → deploy/review.
+  - Fit within the project timeline.
+  - Do NOT give the same milestones to every member — tailor them to what each person is best at.
 
 Each milestone must have:
   - milestone_number  (integer, starts at 1 per member)
   - title             (short, action-oriented)
-  - description       (2–3 sentences specific to the member's role)
+  - description       (2–3 sentences specific to the member's role/skills)
   - due_date          (relative, e.g. "Week 2", "End of Month 1")
-  - role              (the role this milestone belongs to)
+  - assigned_to       (the member's name or identifier from the input)
 
 Return ONLY valid JSON — no markdown, no extra text.
 
 FORMAT:
 {{
-  "assigned_roles": [
-    {{"member": "Member 1", "role": "<role>"}},
-    {{"member": "Member 2", "role": "<role>"}}
-  ],
   "milestone_plans": [
     {{
-      "member": "Member 1",
-      "role": "<role>",
+      "member": "<name or identifier from input>",
+      "specialisation": "<their role / skill set>",
       "milestones": [
         {{
           "milestone_number": 1,
           "title": "<title>",
           "description": "<description>",
           "due_date": "<due_date>",
-          "role": "<role>"
+          "assigned_to": "<name or identifier>"
         }}
       ]
     }}
@@ -132,9 +144,8 @@ FORMAT:
 """.strip()
 
     response = llm.invoke([HumanMessage(content=prompt)])
-    parsed = _parse_json(response.content)
+    parsed   = _parse_json(response.content)
 
-    state["assigned_roles"] = parsed["assigned_roles"]
     state["milestone_plans"] = parsed["milestone_plans"]
     return state
 
@@ -155,13 +166,13 @@ _graph = _build_graph()
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# Public entry point
 # ---------------------------------------------------------------------------
 
 def generate_milestone_plans(project_data: dict) -> dict:
     """
-    Entry point called by the FastAPI router.
-    Makes exactly ONE LLM call to assign roles and generate all milestone plans.
+    Accepts project details including a flexible `team_members` list.
+    Makes exactly ONE LLM call to generate per-member milestone plans.
     """
     initial_state: MilestoneState = {
         "project_title":        project_data.get("project_title", ""),
@@ -169,18 +180,16 @@ def generate_milestone_plans(project_data: dict) -> dict:
         "detailed_description": project_data.get("detailed_description", ""),
         "category":             project_data.get("category", ""),
         "difficulty_level":     project_data.get("difficulty_level", ""),
-        "team_size":            int(project_data.get("team_size", 1)),
+        "team_members":         project_data.get("team_members", []),
         "required_skills":      project_data.get("required_skills", []),
         "project_budget":       project_data.get("project_budget", ""),
         "estimated_duration":   project_data.get("estimated_duration", ""),
         "application_deadline": project_data.get("application_deadline", ""),
-        "assigned_roles":       [],
         "milestone_plans":      [],
     }
 
     final_state = _graph.invoke(initial_state)
 
     return {
-        "assigned_roles":  final_state["assigned_roles"],
         "milestone_plans": final_state["milestone_plans"],
     }
