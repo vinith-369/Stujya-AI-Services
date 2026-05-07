@@ -1,24 +1,19 @@
 """
-Resume Parser API — Stujya AI Features
-=======================================
-A single-file FastAPI service that:
-  1. Accepts a resume PDF upload
+Resume Parser — Stujya AI Features
+====================================
+A plain function that:
+  1. Accepts a resume PDF file path
   2. Sends it to Google Gemini for extraction
-  3. Returns a JSON response matching the StudentSignup form fields
+  3. Returns a dict matching the StudentSignup form fields
 """
 
 import os
 import json
-from typing import Optional
 
-from fastapi import FastAPI, HTTPException
 import PyPDF2
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 import google.generativeai as genai
 from dotenv import load_dotenv
 
-# ── Load environment variables ─────────────────────────────────────────────────
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -30,29 +25,6 @@ if not GEMINI_API_KEY:
 
 genai.configure(api_key=GEMINI_API_KEY)
 
-# ── App setup ──────────────────────────────────────────────────────────────────
-app = FastAPI(
-    title="Stujya Resume Parser",
-    description="Extracts student signup fields from a resume PDF using Gemini AI",
-    version="1.0.0",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ── Include routers from other files ───────────────────────────────────────────
-try:
-    from ai_features.resume_scorer import router as scorer_router
-except ImportError:
-    from resume_scorer import router as scorer_router
-app.include_router(scorer_router)
-
-# ── Valid values (mirrored from StudentSignup.tsx) ─────────────────────────────
 VALID_UNIVERSITIES = [
     "IIT Bombay",
     "IIT Delhi",
@@ -63,24 +35,6 @@ VALID_UNIVERSITIES = [
 ]
 
 
-
-# ── Response model ─────────────────────────────────────────────────────────────
-class ResumeData(BaseModel):
-    """
-    Matches the formData state in StudentSignup.tsx exactly.
-    Fields that cannot be extracted from a resume are left as defaults.
-    """
-    firstName: str = ""
-    lastName: str = ""
-    email: str = ""
-    university: str = ""         # one of VALID_UNIVERSITIES or ""
-    major: str = ""              # e.g. "Computer Science"
-    graduationYear: str = ""     # e.g. "2026"
-    skills: list[str] = []       # subset of VALID_SKILLS
-    bio: str = ""                # short auto-generated bio
-
-
-# ── Gemini prompt ──────────────────────────────────────────────────────────────
 EXTRACTION_PROMPT = """You are an expert resume parser for a student platform called Stujya.
 
 Analyse the attached resume PDF and extract the following fields.
@@ -109,7 +63,6 @@ Rules:
 )
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
 def _clean_json_response(text: str) -> str:
     """Strip markdown code fences if Gemini wraps the JSON."""
     text = text.strip()
@@ -144,39 +97,33 @@ def _validate_and_normalise(data: dict) -> dict:
     return data
 
 
-# ── Request model ──────────────────────────────────────────────────────────────
-class ResumeRequest(BaseModel):
-    """Request body: just the file path to the resume PDF."""
-    file_path: str  # absolute or relative path to the resume PDF
-
-
-# ── API endpoint ───────────────────────────────────────────────────────────────
-@app.post("/parse-resume", response_model=ResumeData)
-async def parse_resume(request: ResumeRequest):
+def parse_resume(file_path: str) -> dict:
     """
-    Provide a local file path to a resume PDF and get back structured JSON
-    matching the Stujya student signup form.
+    Parse a resume PDF and return structured data matching the Stujya
+    student signup form.
 
-    Example request body:
-        {"file_path": "/Users/you/Desktop/resume.pdf"}
+    Args:
+        file_path: Absolute or relative path to the resume PDF.
+
+    Returns:
+        A dict with keys: firstName, lastName, email, university, major,
+        graduationYear, skills, bio.
+
+    Raises:
+        FileNotFoundError: If the file does not exist.
+        ValueError: If the file is not a PDF, is too large, or has no text.
+        RuntimeError: If Gemini fails or returns invalid JSON.
     """
-    file_path = request.file_path
-
-    # ── Validate file exists ───────────────────────────────────────────────
     if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
+        raise FileNotFoundError(f"File not found: {file_path}")
 
     if not file_path.lower().endswith(".pdf"):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Only PDF files are supported. Got: {file_path}",
-        )
+        raise ValueError(f"Only PDF files are supported. Got: {file_path}")
 
     file_size = os.path.getsize(file_path)
     if file_size > 5 * 1024 * 1024:  # 5 MB limit
-        raise HTTPException(status_code=400, detail="File too large. Max 5 MB.")
+        raise ValueError("File too large. Max 5 MB.")
 
-    # ── Extract text from PDF ──────────────────────────────────────────────
     try:
         with open(file_path, "rb") as f:
             reader = PyPDF2.PdfReader(f)
@@ -187,58 +134,35 @@ async def parse_resume(request: ResumeRequest):
                     pdf_text += page_text + "\n"
 
         if not pdf_text.strip():
-            raise HTTPException(
-                status_code=400,
-                detail="Could not extract any text from the PDF. The file may be image-based or corrupted.",
+            raise ValueError(
+                "Could not extract any text from the PDF. "
+                "The file may be image-based or corrupted."
             )
 
-    except HTTPException:
+    except ValueError:
         raise
     except Exception as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Failed to read PDF: {str(e)}",
-        )
+        raise RuntimeError(f"Failed to read PDF: {str(e)}")
 
-    # ── Send text to Gemini ────────────────────────────────────────────────
     try:
         model = genai.GenerativeModel("gemini-2.5-flash")
         prompt_with_resume = f"{EXTRACTION_PROMPT}\n\n--- RESUME TEXT ---\n{pdf_text}\n--- END ---"
         response = model.generate_content(prompt_with_resume)
 
-        # ── Parse response ─────────────────────────────────────────────────
         raw_text = response.text
         cleaned = _clean_json_response(raw_text)
 
         try:
             parsed = json.loads(cleaned)
         except json.JSONDecodeError as e:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Gemini returned invalid JSON: {e}. Raw: {cleaned[:500]}",
+            raise RuntimeError(
+                f"Gemini returned invalid JSON: {e}. Raw: {cleaned[:500]}"
             )
 
-        # ── Validate & normalise ───────────────────────────────────────────
         normalised = _validate_and_normalise(parsed)
-        result = ResumeData(**normalised)
-        return result
+        return normalised
 
-    except HTTPException:
+    except RuntimeError:
         raise
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to process resume: {str(e)}",
-        )
-
-
-# ── Health check ───────────────────────────────────────────────────────────────
-@app.get("/health")
-async def health():
-    return {"status": "ok", "service": "stujya-resume-parser"}
-
-
-# ── Run directly ───────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="localhost", port=8000)
+        raise RuntimeError(f"Failed to process resume: {str(e)}")
